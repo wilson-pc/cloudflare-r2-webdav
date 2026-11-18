@@ -11,4 +11,5 @@ export interface ResourceInfo {
   size: number
   lastModified: Date | null
   etag?: string
+  contentType?: string
 }

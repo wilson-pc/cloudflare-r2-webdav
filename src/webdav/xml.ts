@@ -24,58 +24,62 @@ export function buildMultiStatusXml(resources: ResourceInfo[]): string {
     .map((res) => {
       const href = encodeHref(res.href)
       const isRoot = res.href === '/' || res.name === '/'
-      const nameXml = isRoot || !res.name ? '<d:displayname/>' : `<d:displayname>${escapeXml(res.name)}</d:displayname>`
+      const nameXml = isRoot || !res.name ? '<D:displayname/>' : `<D:displayname>${escapeXml(res.name)}</D:displayname>`
       const lastMod = res.lastModified ? res.lastModified.toUTCString() : new Date().toUTCString()
       const creationDate = res.lastModified ? res.lastModified.toISOString() : new Date().toISOString()
       const etag = res.etag ? escapeXml(res.etag) : ''
 
-      const resourceType = res.isCollection ? '<d:resourcetype><d:collection/></d:resourcetype>' : '<d:resourcetype/>'
+      const resourceType = res.isCollection ? '<D:resourcetype><D:collection/></D:resourcetype>' : '<D:resourcetype/>'
       const contentLengthProp = res.isCollection
-        ? ''
-        : `<d:getcontentlength>${res.size}</d:getcontentlength>`
-      const etagProp = etag ? `<d:getetag>${etag}</d:getetag>` : ''
+        ? '<D:getcontentlength>0</D:getcontentlength>'
+        : `<D:getcontentlength>${res.size}</D:getcontentlength>`
+      const contentTypeProp = res.isCollection
+        ? '<D:getcontenttype>httpd/unix-directory</D:getcontenttype>'
+        : `<D:getcontenttype>${escapeXml(res.contentType || 'application/octet-stream')}</D:getcontenttype>`
+      const etagProp = etag ? `<D:getetag>${etag}</D:getetag>` : ''
 
-      return `    <d:response>
-      <d:href>${href}</d:href>
-      <d:propstat>
-        <d:prop>
+      return `    <D:response>
+      <D:href>${href}</D:href>
+      <D:propstat>
+        <D:prop>
           ${nameXml}
           ${resourceType}
           ${contentLengthProp}
-          <d:getlastmodified>${lastMod}</d:getlastmodified>
-          <d:creationdate>${creationDate}</d:creationdate>
+          ${contentTypeProp}
+          <D:getlastmodified>${lastMod}</D:getlastmodified>
+          <D:creationdate>${creationDate}</D:creationdate>
           ${etagProp}
-        </d:prop>
-        <d:status>HTTP/1.1 200 OK</d:status>
-      </d:propstat>
-    </d:response>`
+        </D:prop>
+        <D:status>HTTP/1.1 200 OK</D:status>
+      </D:propstat>
+    </D:response>`
     })
     .join('\n')
 
   return `<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
+<D:multistatus xmlns:D="DAV:">
 ${responsesXml}
-</d:multistatus>`
+</D:multistatus>`
 }
 
 export function buildLockResponseXml(path: string, lockToken: string): string {
   const href = encodeHref(path)
   return `<?xml version="1.0" encoding="utf-8"?>
-<d:prop xmlns:d="DAV:">
-  <d:lockdiscovery>
-    <d:activelock>
-      <d:locktype><d:write/></d:locktype>
-      <d:lockscope><d:exclusive/></d:lockscope>
-      <d:depth>infinity</d:depth>
-      <d:owner>WebDAV Proxy</d:owner>
-      <d:timeout>Second-3600</d:timeout>
-      <d:locktoken>
-        <d:href>${lockToken}</d:href>
-      </d:locktoken>
-      <d:lockroot>
-        <d:href>${href}</d:href>
-      </d:lockroot>
-    </d:activelock>
-  </d:lockdiscovery>
-</d:prop>`
+<D:prop xmlns:D="DAV:">
+  <D:lockdiscovery>
+    <D:activelock>
+      <D:locktype><D:write/></D:locktype>
+      <D:lockscope><D:exclusive/></D:lockscope>
+      <D:depth>infinity</D:depth>
+      <D:owner>WebDAV Proxy</D:owner>
+      <D:timeout>Second-3600</D:timeout>
+      <D:locktoken>
+        <D:href>${lockToken}</D:href>
+      </D:locktoken>
+      <D:lockroot>
+        <D:href>${href}</D:href>
+      </D:lockroot>
+    </D:activelock>
+  </D:lockdiscovery>
+</D:prop>`
 }

@@ -1,6 +1,6 @@
 import { Context } from 'hono'
 import { Env, ResourceInfo } from '../types'
-import { buildMultiStatusXml, buildLockResponseXml } from './xml'
+import { buildMultiStatusXml, buildLockResponseXml, encodeHref } from './xml'
 
 export async function handleWebDAV(c: Context<{ Bindings: Env }>): Promise<Response> {
   const method = c.req.method.toUpperCase()
@@ -75,6 +75,20 @@ const MIME_TYPES: Record<string, string> = {
   ogg: 'audio/ogg',
   wav: 'audio/wav',
   opus: 'audio/opus',
+  // Subtitles & Documents
+  srt: 'text/plain',
+  vtt: 'text/vtt',
+  ass: 'text/plain',
+  txt: 'text/plain',
+  pdf: 'application/pdf',
+  json: 'application/json',
+  // Images
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
 }
 
 function getMimeType(key: string, existingContentType?: string): string {
@@ -128,6 +142,43 @@ function handleOptions(): Response {
   })
 }
 
+interface ListResult {
+  delimitedPrefixes: Set<string>
+  objects: R2Object[]
+}
+
+async function listAll(
+  bucket: R2Bucket,
+  options: { prefix?: string; delimiter?: string }
+): Promise<ListResult> {
+  const delimitedPrefixes = new Set<string>()
+  const objects: R2Object[] = []
+  let truncated = true
+  let cursor: string | undefined
+
+  while (truncated) {
+    const list = await bucket.list({
+      prefix: options.prefix,
+      delimiter: options.delimiter,
+      cursor,
+      limit: 1000,
+    })
+
+    for (const prefix of list.delimitedPrefixes) {
+      delimitedPrefixes.add(prefix)
+    }
+
+    for (const obj of list.objects) {
+      objects.push(obj)
+    }
+
+    truncated = list.truncated
+    cursor = list.truncated ? list.cursor : undefined
+  }
+
+  return { delimitedPrefixes, objects }
+}
+
 async function handlePropfind(
   c: Context,
   bucket: R2Bucket,
@@ -143,29 +194,52 @@ async function handlePropfind(
 
   if (isRoot) {
     resources.push({
-      href: '/',
+      href: pathname, // '/'
       name: '/',
       isCollection: true,
       size: 0,
       lastModified: new Date(),
+      contentType: 'httpd/unix-directory',
     })
 
     if (depth === 1) {
-      const list = await bucket.list({ prefix: '', delimiter: '/' })
+      const listResult = await listAll(bucket, { prefix: '', delimiter: '/' })
+      const knownFolders = new Set<string>()
 
-      for (const prefix of list.delimitedPrefixes) {
+      for (const prefix of listResult.delimitedPrefixes) {
         const folderName = prefix.replace(/\/$/, '')
-        resources.push({
-          href: '/' + prefix,
-          name: folderName,
-          isCollection: true,
-          size: 0,
-          lastModified: new Date(),
-        })
+        if (folderName) {
+          knownFolders.add(folderName)
+          resources.push({
+            href: '/' + prefix,
+            name: folderName,
+            isCollection: true,
+            size: 0,
+            lastModified: new Date(),
+            contentType: 'httpd/unix-directory',
+          })
+        }
       }
 
-      for (const obj of list.objects) {
-        if (obj.key === '' || obj.key.endsWith('/')) continue
+      for (const obj of listResult.objects) {
+        if (obj.key === '') continue
+
+        if (obj.key.endsWith('/')) {
+          const folderName = obj.key.replace(/\/$/, '')
+          if (folderName && !knownFolders.has(folderName)) {
+            knownFolders.add(folderName)
+            resources.push({
+              href: '/' + obj.key,
+              name: folderName,
+              isCollection: true,
+              size: 0,
+              lastModified: obj.uploaded,
+              contentType: 'httpd/unix-directory',
+            })
+          }
+          continue
+        }
+
         resources.push({
           href: '/' + obj.key,
           name: obj.key,
@@ -173,6 +247,7 @@ async function handlePropfind(
           size: obj.size,
           lastModified: obj.uploaded,
           etag: obj.httpEtag,
+          contentType: getMimeType(obj.key, obj.httpMetadata?.contentType),
         })
       }
     }
@@ -186,60 +261,104 @@ async function handlePropfind(
     let fileObj: R2Object | null = null
 
     if (!isExplicitCollection) {
-      // Check if an exact file object exists (that does not end with /)
       fileObj = await bucket.head(cleanKeyNoSlash)
       if (fileObj && !fileObj.key.endsWith('/')) {
-        isFile = true
+        const ct = fileObj.httpMetadata?.contentType
+        if (ct !== 'application/x-directory') {
+          isFile = true
+        }
       }
     }
 
-    if (!isFile) {
-      // Query R2 for collection matching this directory prefix
-      const list = await bucket.list({ prefix, delimiter: '/', limit: 1000 })
-      if (list.objects.length > 0 || list.delimitedPrefixes.length > 0) {
+    const isCollectionQuery = isExplicitCollection || depthHeader !== '0' || !isFile
+    let listResult: ListResult | null = null
+
+    if (isCollectionQuery) {
+      listResult = await listAll(bucket, { prefix, delimiter: '/' })
+      if (listResult.objects.length > 0 || listResult.delimitedPrefixes.size > 0) {
         isCollection = true
+        isFile = false
+      }
+    }
 
-        const folderName = cleanKeyNoSlash.split('/').pop() || cleanKeyNoSlash
-        const folderHref = pathname.endsWith('/') ? pathname : pathname + '/'
+    if (!isCollection && !isFile && !fileObj) {
+      const folderMarker = await bucket.head(prefix)
+      if (folderMarker) {
+        isCollection = true
+        isFile = false
+      }
+    }
 
-        resources.push({
-          href: folderHref,
-          name: folderName,
-          isCollection: true,
-          size: 0,
-          lastModified: new Date(),
-        })
+    if (isCollection) {
+      const folderName = cleanKeyNoSlash.split('/').pop() || cleanKeyNoSlash
+      // Match the requested pathname so Windows Explorer & macOS Finder match the resource URI
+      const folderHref = pathname
 
-        if (depth === 1) {
-          for (const dirPrefix of list.delimitedPrefixes) {
-            const subName = dirPrefix.slice(prefix.length).replace(/\/$/, '')
+      resources.push({
+        href: folderHref,
+        name: folderName,
+        isCollection: true,
+        size: 0,
+        lastModified: new Date(),
+        contentType: 'httpd/unix-directory',
+      })
+
+      if (depth === 1) {
+        if (!listResult) {
+          listResult = await listAll(bucket, { prefix, delimiter: '/' })
+        }
+
+        const knownSubfolders = new Set<string>()
+
+        for (const dirPrefix of listResult.delimitedPrefixes) {
+          const subName = dirPrefix.slice(prefix.length).replace(/\/$/, '')
+          if (subName) {
+            knownSubfolders.add(subName)
             resources.push({
               href: '/' + dirPrefix,
               name: subName,
               isCollection: true,
               size: 0,
               lastModified: new Date(),
-            })
-          }
-
-          for (const obj of list.objects) {
-            if (obj.key === prefix || obj.key.endsWith('/')) continue
-            const fileName = obj.key.slice(prefix.length)
-            if (!fileName) continue
-            resources.push({
-              href: '/' + obj.key,
-              name: fileName,
-              isCollection: false,
-              size: obj.size,
-              lastModified: obj.uploaded,
-              etag: obj.httpEtag,
+              contentType: 'httpd/unix-directory',
             })
           }
         }
-      }
-    }
 
-    if (isFile && fileObj) {
+        for (const obj of listResult.objects) {
+          if (obj.key === prefix || obj.key === cleanKeyNoSlash) continue
+
+          const relative = obj.key.slice(prefix.length)
+          if (!relative) continue
+
+          if (obj.key.endsWith('/')) {
+            const subName = relative.replace(/\/$/, '')
+            if (subName && !knownSubfolders.has(subName)) {
+              knownSubfolders.add(subName)
+              resources.push({
+                href: '/' + obj.key,
+                name: subName,
+                isCollection: true,
+                size: 0,
+                lastModified: obj.uploaded,
+                contentType: 'httpd/unix-directory',
+              })
+            }
+            continue
+          }
+
+          resources.push({
+            href: '/' + obj.key,
+            name: relative,
+            isCollection: false,
+            size: obj.size,
+            lastModified: obj.uploaded,
+            etag: obj.httpEtag,
+            contentType: getMimeType(obj.key, obj.httpMetadata?.contentType),
+          })
+        }
+      }
+    } else if (isFile && fileObj) {
       const name = cleanKeyNoSlash.split('/').pop() || cleanKeyNoSlash
       resources.push({
         href: pathname,
@@ -248,8 +367,9 @@ async function handlePropfind(
         size: fileObj.size,
         lastModified: fileObj.uploaded,
         etag: fileObj.httpEtag,
+        contentType: getMimeType(fileObj.key, fileObj.httpMetadata?.contentType),
       })
-    } else if (!isCollection) {
+    } else {
       return new Response('Not Found', { status: 404 })
     }
   }
@@ -260,6 +380,9 @@ async function handlePropfind(
     status: 207,
     headers: {
       'Content-Type': 'application/xml; charset=utf-8',
+      'DAV': '1, 2',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'MS-Author-Via': 'DAV',
     },
   })
 }
@@ -408,7 +531,9 @@ async function handleMkcol(c: Context, bucket: R2Bucket, cleanKey: string): Prom
   }
 
   const folderKey = cleanKey.endsWith('/') ? cleanKey : cleanKey + '/'
-  await bucket.put(folderKey, new Uint8Array(0))
+  await bucket.put(folderKey, new Uint8Array(0), {
+    httpMetadata: { contentType: 'application/x-directory' },
+  })
 
   return new Response(null, { status: 201 })
 }
@@ -474,7 +599,7 @@ async function handleCopyOrMove(
   const srcPrefix = srcKey.endsWith('/') ? srcKey : srcKey + '/'
   const destPrefix = destKey.endsWith('/') ? destKey : destKey + '/'
 
-  const list = await bucket.list({ prefix: srcPrefix })
+  const list = await listAll(bucket, { prefix: srcPrefix })
   if (list.objects.length === 0) {
     return new Response('Source Not Found', { status: 404 })
   }
@@ -505,28 +630,30 @@ function handleLock(c: Context, pathname: string): Response {
     status: 200,
     headers: {
       'Content-Type': 'application/xml; charset=utf-8',
+      'DAV': '1, 2',
       'Lock-Token': `<${lockToken}>`,
     },
   })
 }
 
 function handleProppatch(pathname: string): Response {
-  const href = encodeURI(pathname)
+  const href = encodeHref(pathname)
   const xml = `<?xml version="1.0" encoding="utf-8"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>${href}</d:href>
-    <d:propstat>
-      <d:prop/>
-      <d:status>HTTP/1.1 200 OK</d:status>
-    </d:propstat>
-  </d:response>
-</d:multistatus>`
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>${href}</D:href>
+    <D:propstat>
+      <D:prop/>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>`
 
   return new Response(xml, {
     status: 207,
     headers: {
       'Content-Type': 'application/xml; charset=utf-8',
+      'DAV': '1, 2',
     },
   })
 }
